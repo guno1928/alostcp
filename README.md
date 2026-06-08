@@ -29,10 +29,10 @@ import "github.com/guno1928/alostcp/core"
 
 - **Authenticated encryption** -- Every message is sealed with **AEGIS-128L**, a modern AEAD cipher. You get confidentiality *and* integrity: any tampering with the ciphertext, the auth tag, or even the length header is detected and rejected.
 - **Anti-MITM handshake** -- On connect, both sides prove they know the shared password before any data flows. Handshake frames are themselves AEGIS-authenticated.
-- **Fast bulk throughput** -- A hand-written AEGIS-128L AES-NI assembly cipher, validated byte-for-byte against the reference implementation, with a zero-copy receive path and pooled buffers.
+- **Fast bulk throughput** -- AEGIS-128L via a hardware-accelerated implementation (AES-NI on amd64, crypto extensions on arm64, with a pure-Go fallback), plus pooled buffers.
 - **Timeouts built in** -- Context- and deadline-aware dialing, per-operation read/write deadlines, and fail-fast handling of dead connections.
 - **Tiny surface** -- Connect, Listen, Send, Recv. No TLS config, no certificates, no PKI.
-- **Cross-platform** -- Windows and Linux on amd64 (AES-NI required).
+- **Cross-platform** -- Windows and Linux, on amd64 and arm64.
 
 ---
 
@@ -162,7 +162,7 @@ conn.Flush()
 
 ### Reusing a buffer on receive
 
-`RecvInto` decrypts directly into a caller-supplied buffer (zero-copy, no per-message allocation for the payload):
+`RecvInto` decrypts into a caller-supplied buffer (no per-message payload allocation):
 
 ```go
 buf := make([]byte, 64*1024)
@@ -279,7 +279,7 @@ A frame whose authentication tag does not verify, an oversized/invalid length, a
 
 alostcp uses **AEGIS-128L**, a high-performance authenticated cipher built on the AES round function. Unlike a raw stream cipher, AEGIS produces a 128-bit authentication tag per message — tampering is cryptographically detected rather than silently decrypted into garbage.
 
-The production cipher is a **hand-written AES-NI assembly implementation** (`aegis128l_amd64.s`) that keeps all eight 128-bit state words in XMM registers across the whole message, handling init, associated-data absorption, encryption, and finalization in a single call. It is validated **byte-for-byte against the reference implementation** ([`github.com/ericlagergren/aegis`](https://github.com/ericlagergren/aegis)) across all message/AD sizes plus thousands of randomized differential iterations, and its separate-tag API enables a **zero-copy in-place receive** path.
+The cipher is provided by [`github.com/ericlagergren/aegis`](https://github.com/ericlagergren/aegis), which ships optimized assembly for amd64 (AES-NI) and arm64 (crypto extensions), with a constant-time pure-Go fallback on other targets — so alostcp builds and runs everywhere Go does.
 
 ---
 
@@ -321,12 +321,12 @@ All numbers measured on a single machine (**AMD Ryzen 7 5700X, Windows 11, Go 1.
 
 | Payload | Seal MB/s | Open MB/s | allocs |
 |---------|-----------|-----------|--------|
-| 64 B   | 1,879  | 1,519  | 0 |
-| 256 B  | 6,061  | 4,882  | 0 |
-| 1 KB   | 12,051 | 10,683 | 0 |
-| 4 KB   | 14,934 | 15,332 | 0 |
-| 16 KB  | 17,759 | 16,765 | 0 |
-| 64 KB  | 17,802 | 17,304 | 0 |
+| 64 B   | 1,903  | 1,808  | 0 |
+| 256 B  | 5,908  | 5,729  | 0 |
+| 1 KB   | 12,154 | 12,705 | 0 |
+| 4 KB   | 16,034 | 17,010 | 0 |
+| 16 KB  | 17,464 | 19,433 | 0 |
+| 64 KB  | 18,236 | 19,653 | 0 |
 
 **Key insight:** AEGIS-128L scales to ~18 GB/s on bulk payloads (≥4 KB), well above an unauthenticated AES-128-CTR baseline on the same hardware (~11 GB/s) — *while also authenticating*. At small sizes the fixed per-message cost (key/nonce init + finalization) and the 16-byte tag dominate, which is inherent to authenticated encryption.
 
@@ -336,9 +336,9 @@ All numbers measured on a single machine (**AMD Ryzen 7 5700X, Windows 11, Go 1.
 
 | Payload | ns/op | MB/s |
 |---------|-------|------|
-| 1 KB  | ~40,700 | 25 |
-| 16 KB | ~48,000 | 340 |
-| 64 KB | ~87,000 | 750 |
+| 1 KB  | ~38,400 | 27 |
+| 16 KB | ~47,600 | 344 |
+| 64 KB | ~93,900 | 698 |
 
 Round-trip latency is dominated by the kernel and syscalls; the cipher is a small fraction, so encrypted ping-pong tracks raw TCP closely.
 
@@ -348,12 +348,12 @@ Round-trip latency is dominated by the kernel and syscalls; the cipher is a smal
 
 | Payload | ns/op | MB/s |
 |---------|-------|------|
-| 1 KB  | ~464    | 2,205 |
-| 4 KB  | ~1,582  | 2,589 |
-| 16 KB | ~6,104  | 2,684 |
-| 64 KB | ~24,891 | 2,633 |
+| 1 KB  | ~479    | 2,137 |
+| 4 KB  | ~1,498  | 2,734 |
+| 16 KB | ~5,963  | 2,748 |
+| 64 KB | ~23,412 | 2,799 |
 
-The zero-copy receive path keeps bulk streaming at ~2.6 GB/s on loopback — at parity with the previous unauthenticated cipher, now with authentication included. Small messages carry the AEAD per-message overhead and are correspondingly slower.
+Bulk streaming holds ~2.7 GB/s on loopback — on par with the previous unauthenticated cipher, now with authentication included. Small messages carry the AEAD per-message overhead and are correspondingly slower.
 
 *Reproduce with:* `go test -run '^$' -bench 'Benchmark(AEGIS|TCP)' ./core`
 
@@ -375,7 +375,7 @@ This library has not undergone an independent security audit. Review it before r
 Planned / under consideration, roughly in priority order:
 
 1. **Forward secrecy** — ephemeral X25519 key exchange in the handshake, authenticated by the password, for per-session keys.
-2. **Portability fallback** — AES-NI detection plus a pure-Go / non-amd64 path so the library builds and runs on arm64 and CPUs without AES-NI.
+2. **More platforms** — the cipher is portable, but the socket layer currently targets Windows and Linux; macOS (darwin) support is a small addition.
 3. **`net.Conn` adapter** — streaming `Read`/`Write` so alostcp drops into `io.Copy`, `net/http`, etc.
 4. **Config struct** — tunable buffer sizes, max frame size, keepalive, and NoDelay.
 5. **Hardening & quality** — configurable frame-size limits, fuzz tests on frame parsing, and official AEGIS test-vector coverage.
@@ -385,5 +385,5 @@ Planned / under consideration, roughly in priority order:
 ## Requirements
 
 - Go 1.26+
-- **amd64 with AES-NI** (the production cipher is AES-NI assembly; there is currently no non-amd64 / no-AES-NI fallback — see the roadmap)
-- Windows or Linux
+- Windows or Linux, on amd64 or arm64
+- Hardware AES (AES-NI on amd64, crypto extensions on arm64) is used automatically when present; a pure-Go fallback is used otherwise

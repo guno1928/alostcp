@@ -49,9 +49,7 @@ func benchOpen(b *testing.B, mk func() cipher.AEAD) {
 	}
 }
 
-func BenchmarkAEGIS128LLibSeal(b *testing.B) { benchSeal(b, func() cipher.AEAD { return newAEGIS128L("benchmark-password") }) }
-func BenchmarkAEGIS128LLibOpen(b *testing.B) { benchOpen(b, func() cipher.AEAD { return newAEGIS128L("benchmark-password") }) }
-func BenchmarkAEGIS256LibSeal(b *testing.B)  { benchSeal(b, func() cipher.AEAD { return newAEGIS256("benchmark-password") }) }
-func BenchmarkAEGIS256LibOpen(b *testing.B)  { benchOpen(b, func() cipher.AEAD { return newAEGIS256("benchmark-password") }) }
-func BenchmarkAEGIS128LAsmSeal(b *testing.B) { benchSeal(b, func() cipher.AEAD { return newAEGIS128LAsm("benchmark-password") }) }
-func BenchmarkAEGIS128LAsmOpen(b *testing.B) { benchOpen(b, func() cipher.AEAD { return newAEGIS128LAsm("benchmark-password") }) }
+func BenchmarkAEGIS128LSeal(b *testing.B) { benchSeal(b, func() cipher.AEAD { return newAEGIS128L("benchmark-password") }) }
+func BenchmarkAEGIS128LOpen(b *testing.B) { benchOpen(b, func() cipher.AEAD { return newAEGIS128L("benchmark-password") }) }
+func BenchmarkAEGIS256Seal(b *testing.B)  { benchSeal(b, func() cipher.AEAD { return newAEGIS256("benchmark-password") }) }
+func BenchmarkAEGIS256Open(b *testing.B)  { benchOpen(b, func() cipher.AEAD { return newAEGIS256("benchmark-password") }) }

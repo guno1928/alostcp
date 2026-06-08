@@ -34,7 +34,16 @@ func newAEGIS256(password string) cipher.AEAD {
 }
 
 func newConnCipher(password string, sendIV, recvIV []byte) *aeadCipher {
-	return newAEADCipherKey(aegis128LKey(password), sendIV, recvIV)
+	key := aegis128LKey(password)
+	send, err := aegis.New(key)
+	if err != nil {
+		panic(err)
+	}
+	recv, err := aegis.New(key)
+	if err != nil {
+		panic(err)
+	}
+	return newAEADCipher(send, recv, sendIV, recvIV)
 }
 
 func newHandshakeAEAD(password string) cipher.AEAD {

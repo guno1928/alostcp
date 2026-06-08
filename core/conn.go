@@ -210,24 +210,23 @@ func (c *Conn) RecvInto(buf []byte) (int, error) {
 		return 0, err
 	}
 
-	if _, err := io.ReadFull(c.br, buf[:plainLen]); err != nil {
+	tmp := getFrame(cipherLen)
+	if _, err := io.ReadFull(c.br, tmp); err != nil {
 		err = c.poison(err)
 		c.rmu.Unlock()
-		return 0, err
-	}
-	var tag [tagSize]byte
-	if _, err := io.ReadFull(c.br, tag[:]); err != nil {
-		err = c.poison(err)
-		c.rmu.Unlock()
+		putFrame(tmp)
 		return 0, err
 	}
 
-	if err := c.cipher.openInPlace(buf[:plainLen], tag[:], lenBuf[:]); err != nil {
+	_, err := c.cipher.open(buf[:0], tmp, lenBuf[:])
+	if err != nil {
 		err = c.poison(err)
 		c.rmu.Unlock()
+		putFrame(tmp)
 		return 0, err
 	}
 	c.rmu.Unlock()
+	putFrame(tmp)
 	return plainLen, nil
 }
 

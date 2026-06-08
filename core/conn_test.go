@@ -314,22 +314,20 @@ func TestConnectTimeoutSucceeds(t *testing.T) {
 }
 
 func TestAEADNonceDesyncFails(t *testing.T) {
-	key := make([]byte, 16)
-	rand.Read(key)
 	iv := make([]byte, 16)
 	rand.Read(iv)
 
-	a := newAEADCipherKey(key, iv, iv)
-	ad := []byte{0, 0, 0, 16}
+	a := newConnCipher("pw", iv, iv)
 	msg := []byte("hello world 1234")
+	ad := []byte{0, 0, 0, byte(len(msg) + tagSize)}
 
 	dst := make([]byte, len(msg)+tagSize)
 	a.seal(dst, msg, ad)
 
-	b := newAEADCipherKey(key, iv, iv)
-	incrementNonce(b.recvNonce[:])
+	b := newConnCipher("pw", iv, iv)
+	incrementNonce(b.recvNonce)
 
-	if err := b.openInPlace(append([]byte(nil), dst[:len(msg)]...), dst[len(msg):], ad); err == nil {
+	if _, err := b.open(make([]byte, 0, len(msg)), dst, ad); err == nil {
 		t.Fatal("open succeeded with desynced nonce")
 	}
 }
