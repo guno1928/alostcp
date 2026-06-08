@@ -15,13 +15,13 @@ func handshakeFrame(conn *net.TCPConn, password string, plaintext []byte) error 
 	if _, err := io.ReadFull(randReader, nonce); err != nil {
 		return err
 	}
-	cipherLen := 16 + len(plaintext)
+	aead := newHandshakeAEAD(password)
+	enc := aead.Seal(nil, nonce, plaintext, nil)
+	cipherLen := 16 + len(enc)
 	frame := make([]byte, 4+cipherLen)
 	binary.BigEndian.PutUint32(frame[0:4], uint32(cipherLen))
 	copy(frame[4:20], nonce)
-
-	stream := newHandshakeCipher(password, nonce)
-	stream.XORKeyStream(frame[20:], plaintext)
+	copy(frame[20:], enc)
 
 	_, err := conn.Write(frame)
 	return err
@@ -33,7 +33,7 @@ func readHandshakeFrame(conn *net.TCPConn, password string) ([]byte, error) {
 		return nil, err
 	}
 	cipherLen := int(binary.BigEndian.Uint32(lenBuf[:]))
-	if cipherLen < 16 {
+	if cipherLen < 16+tagSize {
 		return nil, errors.New("alostcp: invalid handshake frame")
 	}
 	cipherBuf := make([]byte, cipherLen)
@@ -42,11 +42,12 @@ func readHandshakeFrame(conn *net.TCPConn, password string) ([]byte, error) {
 	}
 	nonce := cipherBuf[:16]
 	enc := cipherBuf[16:]
-	plain := make([]byte, len(enc))
 
-	stream := newHandshakeCipher(password, nonce)
-	stream.XORKeyStream(plain, enc)
-
+	aead := newHandshakeAEAD(password)
+	plain, err := aead.Open(nil, nonce, enc, nil)
+	if err != nil {
+		return nil, errors.New("alostcp: handshake authentication failed")
+	}
 	return plain, nil
 }
 

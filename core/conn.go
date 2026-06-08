@@ -9,48 +9,79 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var randReader = rand.Reader
 
 var ErrConnClosed = errors.New("alostcp: connection closed")
 
+// ErrConnBroken is returned once a framed read or write has failed partway
+// through. Because the AEGIS stream cannot be resynchronized after a partial
+// frame, the connection is poisoned and all further operations fail.
+var ErrConnBroken = errors.New("alostcp: connection broken")
+
 // Conn is an encrypted TCP connection.
 type Conn struct {
 	closed  atomic.Bool
+	broken  atomic.Bool
 	tcp     *net.TCPConn
-	cipher  *Cipher
+	cipher  *aeadCipher
 	br      *bufio.Reader
 	bw      *bufio.Writer
 	wmu sync.Mutex
 	rmu     sync.Mutex
 }
 
-// Send encrypts and transmits a framed message.
-func (c *Conn) Send(data []byte) error {
+func (c *Conn) stateErr() error {
+	if c.broken.Load() {
+		return ErrConnBroken
+	}
 	if c.closed.Load() {
 		return ErrConnClosed
 	}
+	return nil
+}
 
-	cipherLen := len(data)
+// poison marks the connection broken after a partial framed I/O failure and
+// closes the underlying socket. It returns ErrConnBroken if err is nil.
+func (c *Conn) poison(err error) error {
+	c.broken.Store(true)
+	c.tcp.Close()
+	if err == nil {
+		return ErrConnBroken
+	}
+	return err
+}
+
+// Send encrypts and transmits a framed message.
+func (c *Conn) Send(data []byte) error {
+	if err := c.stateErr(); err != nil {
+		return err
+	}
+
+	cipherLen := len(data) + tagSize
 	frame := getFrame(4 + cipherLen)
 
 	binary.BigEndian.PutUint32(frame[0:4], uint32(cipherLen))
-	c.cipher.encrypt(frame[4:], data)
 
 	c.wmu.Lock()
-	if c.closed.Load() {
-		c.wmu.Unlock()
-		putFrame(frame)
-		return ErrConnClosed
-	}
-	_, err := c.bw.Write(frame)
-	if err != nil {
+	if err := c.stateErr(); err != nil {
 		c.wmu.Unlock()
 		putFrame(frame)
 		return err
 	}
-	err = c.bw.Flush()
+	c.cipher.seal(frame[4:], data, frame[0:4])
+	_, err := c.bw.Write(frame)
+	if err != nil {
+		err = c.poison(err)
+		c.wmu.Unlock()
+		putFrame(frame)
+		return err
+	}
+	if err = c.bw.Flush(); err != nil {
+		err = c.poison(err)
+	}
 	c.wmu.Unlock()
 	putFrame(frame)
 	return err
@@ -59,23 +90,26 @@ func (c *Conn) Send(data []byte) error {
 // SendBuffered encrypts and queues a framed message without flushing.
 // Call Flush to transmit the batch.
 func (c *Conn) SendBuffered(data []byte) error {
-	if c.closed.Load() {
-		return ErrConnClosed
+	if err := c.stateErr(); err != nil {
+		return err
 	}
 
-	cipherLen := len(data)
+	cipherLen := len(data) + tagSize
 	frame := getFrame(4 + cipherLen)
 
 	binary.BigEndian.PutUint32(frame[0:4], uint32(cipherLen))
-	c.cipher.encrypt(frame[4:], data)
 
 	c.wmu.Lock()
-	if c.closed.Load() {
+	if err := c.stateErr(); err != nil {
 		c.wmu.Unlock()
 		putFrame(frame)
-		return ErrConnClosed
+		return err
 	}
+	c.cipher.seal(frame[4:], data, frame[0:4])
 	_, err := c.bw.Write(frame)
+	if err != nil {
+		err = c.poison(err)
+	}
 	c.wmu.Unlock()
 	putFrame(frame)
 	return err
@@ -84,11 +118,14 @@ func (c *Conn) SendBuffered(data []byte) error {
 // Flush writes any buffered data to the underlying TCP connection.
 func (c *Conn) Flush() error {
 	c.wmu.Lock()
-	if c.closed.Load() {
+	if err := c.stateErr(); err != nil {
 		c.wmu.Unlock()
-		return ErrConnClosed
+		return err
 	}
 	err := c.bw.Flush()
+	if err != nil {
+		err = c.poison(err)
+	}
 	c.wmu.Unlock()
 	return err
 }
@@ -100,34 +137,42 @@ func (c *Conn) SendString(s string) error {
 
 // Recv reads and decrypts one framed message.
 func (c *Conn) Recv() ([]byte, error) {
-	if c.closed.Load() {
-		return nil, ErrConnClosed
+	if err := c.stateErr(); err != nil {
+		return nil, err
 	}
 
 	c.rmu.Lock()
-	if c.closed.Load() {
+	if err := c.stateErr(); err != nil {
 		c.rmu.Unlock()
-		return nil, ErrConnClosed
+		return nil, err
 	}
 
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(c.br, lenBuf[:]); err != nil {
+		err = c.poison(err)
 		c.rmu.Unlock()
 		return nil, err
 	}
 	cipherLen := int(binary.BigEndian.Uint32(lenBuf[:]))
-	if cipherLen < 0 || cipherLen > 1024*1024*64 {
-		c.rmu.Unlock()
-		return nil, errors.New("alostcp: invalid frame length")
-	}
-
-	plain := make([]byte, cipherLen)
-	if _, err := io.ReadFull(c.br, plain); err != nil {
+	if cipherLen < tagSize || cipherLen > 1024*1024*64 {
+		err := c.poison(errors.New("alostcp: invalid frame length"))
 		c.rmu.Unlock()
 		return nil, err
 	}
 
-	c.cipher.decrypt(plain, plain)
+	buf := make([]byte, cipherLen)
+	if _, err := io.ReadFull(c.br, buf); err != nil {
+		err = c.poison(err)
+		c.rmu.Unlock()
+		return nil, err
+	}
+
+	plain, err := c.cipher.open(buf[:0], buf, lenBuf[:])
+	if err != nil {
+		err = c.poison(err)
+		c.rmu.Unlock()
+		return nil, err
+	}
 	c.rmu.Unlock()
 	return plain, nil
 }
@@ -136,39 +181,54 @@ func (c *Conn) Recv() ([]byte, error) {
 // It returns the number of bytes written to buf. If the message is larger
 // than len(buf), it returns an error.
 func (c *Conn) RecvInto(buf []byte) (int, error) {
-	if c.closed.Load() {
-		return 0, ErrConnClosed
+	if err := c.stateErr(); err != nil {
+		return 0, err
 	}
 
 	c.rmu.Lock()
-	if c.closed.Load() {
+	if err := c.stateErr(); err != nil {
 		c.rmu.Unlock()
-		return 0, ErrConnClosed
+		return 0, err
 	}
 
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(c.br, lenBuf[:]); err != nil {
+		err = c.poison(err)
 		c.rmu.Unlock()
 		return 0, err
 	}
 	cipherLen := int(binary.BigEndian.Uint32(lenBuf[:]))
-	if cipherLen < 0 || cipherLen > 1024*1024*64 {
+	if cipherLen < tagSize || cipherLen > 1024*1024*64 {
+		err := c.poison(errors.New("alostcp: invalid frame length"))
 		c.rmu.Unlock()
-		return 0, errors.New("alostcp: invalid frame length")
+		return 0, err
 	}
-	if cipherLen > len(buf) {
-		c.rmu.Unlock()
-		return 0, errors.New("alostcp: message larger than provided buffer")
-	}
-
-	if _, err := io.ReadFull(c.br, buf[:cipherLen]); err != nil {
+	plainLen := cipherLen - tagSize
+	if plainLen > len(buf) {
+		err := c.poison(errors.New("alostcp: message larger than provided buffer"))
 		c.rmu.Unlock()
 		return 0, err
 	}
 
-	c.cipher.decrypt(buf[:cipherLen], buf[:cipherLen])
+	if _, err := io.ReadFull(c.br, buf[:plainLen]); err != nil {
+		err = c.poison(err)
+		c.rmu.Unlock()
+		return 0, err
+	}
+	var tag [tagSize]byte
+	if _, err := io.ReadFull(c.br, tag[:]); err != nil {
+		err = c.poison(err)
+		c.rmu.Unlock()
+		return 0, err
+	}
+
+	if err := c.cipher.openInPlace(buf[:plainLen], tag[:], lenBuf[:]); err != nil {
+		err = c.poison(err)
+		c.rmu.Unlock()
+		return 0, err
+	}
 	c.rmu.Unlock()
-	return cipherLen, nil
+	return plainLen, nil
 }
 
 // RecvString reads and decrypts one framed message as a string.
@@ -198,4 +258,25 @@ func (c *Conn) Close() error {
 // transmission in hopes of sending fewer packets (Nagle's algorithm).
 func (c *Conn) SetNoDelay(noDelay bool) error {
 	return c.tcp.SetNoDelay(noDelay)
+}
+
+// SetDeadline sets the read and write deadlines on the connection.
+//
+// If a Send or Recv exceeds a deadline mid-frame, the encrypted stream can no
+// longer be resynchronized: the connection is poisoned and all further
+// operations return ErrConnBroken.
+func (c *Conn) SetDeadline(t time.Time) error {
+	return c.tcp.SetDeadline(t)
+}
+
+// SetReadDeadline sets the deadline for future Recv and RecvInto calls.
+// See SetDeadline for the consequences of a mid-frame timeout.
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	return c.tcp.SetReadDeadline(t)
+}
+
+// SetWriteDeadline sets the deadline for future Send, SendBuffered, and Flush
+// calls. See SetDeadline for the consequences of a mid-frame timeout.
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	return c.tcp.SetWriteDeadline(t)
 }
