@@ -1,48 +1,44 @@
 package core
 
-import "crypto/cipher"
+const (
+	tagSize   = 16
+	nonceSize = 16
+)
 
-const tagSize = 16
-
-type aeadCipher struct {
-	send      cipher.AEAD
-	recv      cipher.AEAD
-	sendNonce []byte
-	recvNonce []byte
+type sealer struct {
+	engine aegisEngine
+	nonce  [nonceSize]byte
 }
 
-func newAEADCipher(send, recv cipher.AEAD, sendIV, recvIV []byte) *aeadCipher {
-	sn := make([]byte, send.NonceSize())
-	rn := make([]byte, recv.NonceSize())
-	copy(sn, sendIV)
-	copy(rn, recvIV)
-	return &aeadCipher{
-		send:      send,
-		recv:      recv,
-		sendNonce: sn,
-		recvNonce: rn,
+func (s *sealer) seal(dst, plaintext, ad []byte) {
+	s.engine.seal(&s.nonce, dst, plaintext, ad)
+	incrementNonce(&s.nonce)
+}
+
+func (s *sealer) wipe() {
+	s.engine.wipe()
+	clear(s.nonce[:])
+}
+
+type opener struct {
+	engine aegisEngine
+	nonce  [nonceSize]byte
+}
+
+func (o *opener) open(dst, ciphertext, tag, ad []byte) bool {
+	if !o.engine.open(&o.nonce, dst, ciphertext, tag, ad) {
+		return false
 	}
+	incrementNonce(&o.nonce)
+	return true
 }
 
-// seal encrypts plaintext into dst (which must have cap >= len(plaintext)+tagSize),
-// authenticates ad, and advances the send nonce.
-func (c *aeadCipher) seal(dst, plaintext, ad []byte) {
-	c.send.Seal(dst[:0], c.sendNonce, plaintext, ad)
-	incrementNonce(c.sendNonce)
+func (o *opener) wipe() {
+	o.engine.wipe()
+	clear(o.nonce[:])
 }
 
-// open verifies and decrypts ciphertextWithTag into dst, authenticating ad, and
-// advances the recv nonce on success.
-func (c *aeadCipher) open(dst, ciphertextWithTag, ad []byte) ([]byte, error) {
-	plain, err := c.recv.Open(dst[:0], c.recvNonce, ciphertextWithTag, ad)
-	if err != nil {
-		return nil, err
-	}
-	incrementNonce(c.recvNonce)
-	return plain, nil
-}
-
-func incrementNonce(nonce []byte) {
+func incrementNonce(nonce *[nonceSize]byte) {
 	for i := len(nonce) - 1; i >= 0; i-- {
 		nonce[i]++
 		if nonce[i] != 0 {

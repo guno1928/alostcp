@@ -199,6 +199,11 @@ seal_fin_loop:
 	MOVQ R12, AX
 	ADDQ R10, AX
 	MOVOU X14, (AX)
+	PXOR X8, X8
+	MOVOU X8, 0(SP)
+	MOVOU X8, 16(SP)
+	MOVOU X8, 32(SP)
+	MOVOU X8, 48(SP)
 	RET
 
 // func aegisOpen(key, nonce, dst, src, ad, tag *byte, srcLen, adLen int)
@@ -337,4 +342,9 @@ open_fin_loop:
 	PXOR X6, X14
 	MOVQ tag+40(FP), AX
 	MOVOU X14, (AX)
+	PXOR X8, X8
+	MOVOU X8, 0(SP)
+	MOVOU X8, 16(SP)
+	MOVOU X8, 32(SP)
+	MOVOU X8, 48(SP)
 	RET

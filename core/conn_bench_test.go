@@ -7,15 +7,15 @@ import (
 	"testing"
 )
 
+const testPassword = "benchmark-password"
+
 func newConnPair(tb testing.TB) (client, server *Conn) {
 	tb.Helper()
-	const password = "benchmark-password"
 
-	ln, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	listener, err := ListenHost("127.0.0.1", 0, testPassword)
 	if err != nil {
 		tb.Fatal(err)
 	}
-	listener := &Listener{ln: ln, password: password}
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -25,8 +25,8 @@ func newConnPair(tb testing.TB) (client, server *Conn) {
 		server, srvErr = listener.Accept()
 	}()
 
-	addr := ln.Addr().(*net.TCPAddr)
-	client, err = Connect("127.0.0.1", addr.Port, password)
+	addr := listener.Addr().(*net.TCPAddr)
+	client, err = Connect("127.0.0.1", addr.Port, testPassword)
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -116,6 +116,76 @@ func BenchmarkTCPStream(b *testing.B) {
 			}
 			if err := client.Flush(); err != nil {
 				b.Fatal(err)
+			}
+			if err := <-done; err != nil {
+				b.Fatal(err)
+			}
+			b.StopTimer()
+		})
+	}
+}
+
+func BenchmarkHandshake(b *testing.B) {
+	listener, err := ListenHost("127.0.0.1", 0, testPassword)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	port := listener.Addr().(*net.TCPAddr).Port
+	if _, err := derivePasswordKey(testPassword); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		c, err := Connect("127.0.0.1", port, testPassword)
+		if err != nil {
+			b.Fatal(err)
+		}
+		c.Close()
+	}
+}
+
+func BenchmarkTCPStreamWriteRead(b *testing.B) {
+	for _, size := range benchSizes {
+		b.Run(sizeName(size), func(b *testing.B) {
+			client, server := newConnPair(b)
+			msg := make([]byte, size)
+			rand.Read(msg)
+
+			total := int64(size) * int64(b.N)
+			done := make(chan error, 1)
+			go func() {
+				buf := make([]byte, max(size, streamChunkSize))
+				var got int64
+				for got < total {
+					n, err := server.Read(buf)
+					if err != nil {
+						done <- err
+						return
+					}
+					got += int64(n)
+				}
+				done <- nil
+			}()
+
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := client.Write(msg); err != nil {
+					b.Fatal(err)
+				}
 			}
 			if err := <-done; err != nil {
 				b.Fatal(err)

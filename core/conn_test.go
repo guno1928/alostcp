@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"net"
+	"os"
 	"sort"
 	"sync"
 	"testing"
@@ -86,27 +86,29 @@ func TestConnRecvInto(t *testing.T) {
 }
 
 func TestConnWrongPassword(t *testing.T) {
-	ln, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	ln, err := ListenHost("127.0.0.1", 0, "correct-password")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	listener := &Listener{ln: ln, password: "correct-password"}
 
-	errCh := make(chan error, 1)
-	go func() {
-		_, err := listener.Accept()
-		errCh <- err
-	}()
-
+	errCh := handshakeAsync(ln)
 	addr := ln.Addr().(*net.TCPAddr)
 	_, err = Connect("127.0.0.1", addr.Port, "wrong-password")
-	if err == nil {
-		t.Fatal("expected client handshake to fail with wrong password")
+	if !errors.Is(err, ErrHandshake) {
+		t.Fatalf("expected client handshake to fail with ErrHandshake, got %v", err)
 	}
-	if serr := <-errCh; serr == nil {
-		t.Fatal("expected server handshake to reject wrong password")
+	if serr := <-errCh; !errors.Is(serr, ErrHandshake) {
+		t.Fatalf("expected server handshake to reject wrong password, got %v", serr)
 	}
+}
+
+func sealRawFrame(c *Conn, msg []byte, flags uint32) []byte {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	frame := make([]byte, frameHeaderSize+len(msg)+tagSize)
+	c.sealFrame(frame, msg, frameHeader(len(msg), flags))
+	return frame
 }
 
 func TestConnTamperRejected(t *testing.T) {
@@ -114,39 +116,47 @@ func TestConnTamperRejected(t *testing.T) {
 
 	msg := make([]byte, 500)
 	rand.Read(msg)
-
-	cipherLen := len(msg) + tagSize
-	frame := make([]byte, 4+cipherLen)
-	binary.BigEndian.PutUint32(frame[0:4], uint32(cipherLen))
-	client.cipher.seal(frame[4:], msg, frame[0:4])
-	frame[4+200] ^= 0x80
+	frame := sealRawFrame(client, msg, 0)
+	frame[frameHeaderSize+200] ^= 0x80
 
 	if _, err := client.tcp.Write(frame); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.Recv(); err == nil {
-		t.Fatal("server accepted a tampered frame")
+	if _, err := server.Recv(); !errors.Is(err, ErrConnBroken) {
+		t.Fatalf("expected ErrConnBroken for a tampered frame, got %v", err)
 	}
 }
 
-func TestConnTamperedLengthRejected(t *testing.T) {
+func TestConnCloseFlagIsAuthenticated(t *testing.T) {
 	client, server := newConnPair(t)
 
-	msg := make([]byte, 300)
-	rand.Read(msg)
-
-	cipherLen := len(msg) + tagSize
-	frame := make([]byte, 4+cipherLen)
-	binary.BigEndian.PutUint32(frame[0:4], uint32(cipherLen))
-	client.cipher.seal(frame[4:], msg, frame[0:4])
-	binary.BigEndian.PutUint32(frame[0:4], uint32(cipherLen+0))
-	frame[2] ^= 0x01
+	frame := sealRawFrame(client, nil, 0)
+	frame[0] |= byte(closeNotifyFlag >> 24)
 
 	if _, err := client.tcp.Write(frame); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.Recv(); err == nil {
-		t.Fatal("server accepted a frame with tampered length AD")
+	if _, err := server.Recv(); !errors.Is(err, ErrConnBroken) {
+		t.Fatalf("forged close notification was not rejected: %v", err)
+	}
+}
+
+func TestOpenRejectsDifferentAD(t *testing.T) {
+	var key [sessionKeySize]byte
+	rand.Read(key[:])
+	s := sealer{engine: newAEGISEngine(&key)}
+	o := opener{engine: newAEGISEngine(&key)}
+
+	msg := []byte("length-bound message")
+	sealed := make([]byte, len(msg)+tagSize)
+	s.seal(sealed, msg, []byte{0, 0, 0, byte(len(sealed))})
+
+	out := make([]byte, len(msg))
+	if o.open(out, sealed[:len(msg)], sealed[len(msg):], []byte{0, 0, 1, byte(len(sealed))}) {
+		t.Fatal("open accepted a frame whose length header differs from the sealed one")
+	}
+	if !o.open(out, sealed[:len(msg)], sealed[len(msg):], []byte{0, 0, 0, byte(len(sealed))}) || !bytes.Equal(out, msg) {
+		t.Fatal("open rejected the genuine frame")
 	}
 }
 
@@ -255,21 +265,27 @@ func TestConnectContextCanceled(t *testing.T) {
 	}
 }
 
-func TestReadDeadlinePoisonsConn(t *testing.T) {
-	client, _ := newConnPair(t)
+func TestReadDeadlineBetweenFramesKeepsConn(t *testing.T) {
+	client, server := newConnPair(t)
 
-	if err := client.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+	if err := client.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Recv(); err == nil {
-		t.Fatal("expected deadline error on Recv")
+	if _, err := client.Recv(); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expected deadline error on Recv, got %v", err)
 	}
-
-	if _, err := client.Recv(); !errors.Is(err, ErrConnBroken) {
-		t.Fatalf("expected ErrConnBroken after timeout, got %v", err)
+	if err := client.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
 	}
-	if err := client.Send([]byte("x")); !errors.Is(err, ErrConnBroken) {
-		t.Fatalf("expected ErrConnBroken on Send after timeout, got %v", err)
+	if err := server.Send([]byte("still alive")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.Recv()
+	if err != nil || string(got) != "still alive" {
+		t.Fatalf("connection unusable after an idle timeout: %q %v", got, err)
+	}
+	if err := client.Send([]byte("x")); err != nil {
+		t.Fatalf("send after idle timeout: %v", err)
 	}
 }
 
@@ -314,20 +330,20 @@ func TestConnectTimeoutSucceeds(t *testing.T) {
 }
 
 func TestAEADNonceDesyncFails(t *testing.T) {
-	iv := make([]byte, 16)
-	rand.Read(iv)
+	var key [sessionKeySize]byte
+	rand.Read(key[:])
 
-	a := newConnCipher("pw", iv, iv)
+	a := sealer{engine: newAEGISEngine(&key)}
+	ad := []byte{0, 0, 0, 16}
 	msg := []byte("hello world 1234")
-	ad := []byte{0, 0, 0, byte(len(msg) + tagSize)}
-
 	dst := make([]byte, len(msg)+tagSize)
 	a.seal(dst, msg, ad)
 
-	b := newConnCipher("pw", iv, iv)
-	incrementNonce(b.recvNonce)
+	b := opener{engine: newAEGISEngine(&key)}
+	incrementNonce(&b.nonce)
 
-	if _, err := b.open(make([]byte, 0, len(msg)), dst, ad); err == nil {
+	out := make([]byte, len(msg))
+	if b.open(out, dst[:len(msg)], dst[len(msg):], ad) {
 		t.Fatal("open succeeded with desynced nonce")
 	}
 }
